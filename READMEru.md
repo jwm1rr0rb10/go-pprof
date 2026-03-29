@@ -31,7 +31,7 @@ package main
 import (
     "net/http"
 
-    "yourproject/pprof" // замените на путь к вашему пакету
+    "github.com/jwm1rr0rb10/go-pprof"
 )
 
 func main() {
@@ -63,7 +63,7 @@ import (
     "log"
     "time"
 
-    "yourproject/pprof"
+    "github.com/jwm1rr0rb10/go-pprof"
 )
 
 func main() {

@@ -140,5 +140,5 @@ go test ./...
 ---
 
 ## ## License
-[MIT License](https://github.com/jwm1rr0rb10/go-errors/blob/main/LICENSE) – © Raman Zaitsau [@jwm1rrr0rb10](https://github.com/jwm1rr0rb10)
+[MIT License](https://github.com/jwm1rr0rb10/go-pprof/blob/main/LICENSE) – © Raman Zaitsau [@jwm1rrr0rb10](https://github.com/jwm1rr0rb10)
 

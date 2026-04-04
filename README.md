@@ -18,7 +18,7 @@ A simple, safe, and production-ready library for enabling **pprof** profiling in
 Simply add the package to your project:
 
 ```bash
-github.com/jwm1rr0rb10/go-pprof
+go get -u github.com/jwm1rr0rb10/go-pprof
 ```
 
 ---

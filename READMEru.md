@@ -16,7 +16,7 @@
 Просто добавьте пакет в свой проект:
 
 ```bash
-github.com/jwm1rr0rb10/go-pprof
+go get -u github.com/jwm1rr0rb10/go-pprof
 ```
 
 ---

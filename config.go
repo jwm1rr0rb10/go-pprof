@@ -8,7 +8,18 @@ const (
 	DefaultHost              = "127.0.0.1"
 	DefaultPort              = 6060
 	DefaultReadHeaderTimeout = 10 * time.Second
+	DefaultIdleTimeout       = 60 * time.Second
 	DefaultShutdownTimeout   = 15 * time.Second
+	maxHeaderBytes           = 64 << 10
+)
+
+// Recommended settings for Config.BlockProfileRate and
+// Config.MutexProfileFraction on a busy service: enough samples to find
+// contention, with low constant overhead. Rate 1 / fraction 1 record every
+// event and are too expensive for production.
+const (
+	RecommendedBlockProfileRate     = 10_000 // record blocking events of ~10µs and longer
+	RecommendedMutexProfileFraction = 100    // record 1 of 100 mutex contention events
 )
 
 // Config holds the configuration for the standalone pprof [Server].
@@ -29,17 +40,37 @@ type Config struct {
 	// as long as the client requests (30s by default for /profile).
 	ReadHeaderTimeout time.Duration
 
+	// IdleTimeout closes idle keep-alive connections.
+	// 0 means DefaultIdleTimeout (60s).
+	IdleTimeout time.Duration
+
 	// ShutdownTimeout bounds the graceful shutdown performed when the
 	// context passed to [Server.Run] or [Server.Serve] is canceled.
 	ShutdownTimeout time.Duration
 
 	// Middlewares wrap every pprof handler. The first one is the outermost.
+	// They run before the Limits checks, so put authentication here.
 	Middlewares []Middleware
+
+	// Limits protect the service from expensive requests. The zero value
+	// is a safe production configuration; see [Limits].
+	Limits Limits
+
+	// BlockProfileRate, if > 0, is passed to runtime.SetBlockProfileRate
+	// when the server starts, enabling /debug/pprof/block.
+	// See RecommendedBlockProfileRate. This is a process-wide setting.
+	BlockProfileRate int
+
+	// MutexProfileFraction, if > 0, is passed to
+	// runtime.SetMutexProfileFraction when the server starts, enabling
+	// /debug/pprof/mutex. See RecommendedMutexProfileFraction.
+	// This is a process-wide setting.
+	MutexProfileFraction int
 }
 
 // NewConfig creates a Config with the most common fields set.
 // Zero values are replaced with defaults by [NewServer]. For other fields
-// (ShutdownTimeout, Middlewares) use a Config struct literal.
+// (Limits, Middlewares, ...) use a Config struct literal.
 func NewConfig(host string, port int, readHeaderTimeout time.Duration) Config {
 	return Config{
 		Host:              host,
@@ -57,6 +88,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ReadHeaderTimeout <= 0 {
 		c.ReadHeaderTimeout = DefaultReadHeaderTimeout
+	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = DefaultIdleTimeout
 	}
 	if c.ShutdownTimeout <= 0 {
 		c.ShutdownTimeout = DefaultShutdownTimeout

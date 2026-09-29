@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"runtime"
 	"strconv"
 	"time"
 )
@@ -23,6 +24,11 @@ const (
 
 // Register mounts all standard pprof handlers on mux under /debug/pprof/.
 // Optional middlewares wrap every handler; the first one is the outermost.
+//
+// Register adds no limits by itself. On a production service pass [Guard]
+// as the last middleware (after authentication):
+//
+//	pprof.Register(mux, auth, pprof.Guard(pprof.Limits{}))
 //
 // Note: this exposes pprof on whatever address mux is served on. Prefer a
 // separate [Server] on localhost, or protect the endpoints with
@@ -53,24 +59,38 @@ func Handler(mws ...Middleware) http.Handler {
 // A Server is single-use: once it has been shut down it cannot be started
 // again. Its methods are safe for concurrent use.
 type Server struct {
-	addr            string
-	shutdownTimeout time.Duration
-	srv             *http.Server
+	addr                 string
+	shutdownTimeout      time.Duration
+	blockProfileRate     int
+	mutexProfileFraction int
+	srv                  *http.Server
 }
 
 // NewServer creates a new pprof server. Zero-valued fields of cfg are
-// replaced with defaults, so NewServer(Config{}) listens on 127.0.0.1:6060.
+// replaced with defaults, so NewServer(Config{}) listens on 127.0.0.1:6060
+// with the default [Limits].
 func NewServer(cfg Config) *Server {
 	cfg = cfg.withDefaults()
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
+	// User middlewares (auth, allowlists) run first, then the limits.
+	mws := make([]Middleware, 0, len(cfg.Middlewares)+1)
+	mws = append(mws, cfg.Middlewares...)
+	mws = append(mws, Guard(cfg.Limits))
+
 	return &Server{
-		addr:            addr,
-		shutdownTimeout: cfg.ShutdownTimeout,
+		addr:                 addr,
+		shutdownTimeout:      cfg.ShutdownTimeout,
+		blockProfileRate:     cfg.BlockProfileRate,
+		mutexProfileFraction: cfg.MutexProfileFraction,
 		srv: &http.Server{
 			Addr:              addr,
-			Handler:           Handler(cfg.Middlewares...),
+			Handler:           Handler(mws...),
 			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+			IdleTimeout:       cfg.IdleTimeout,
+			MaxHeaderBytes:    maxHeaderBytes,
+			// No WriteTimeout: /profile and /trace legitimately stream for a
+			// long time. Guard sets a per-request write deadline instead.
 		},
 	}
 }
@@ -98,6 +118,13 @@ func (s *Server) Run(ctx context.Context) error {
 // one bound to "127.0.0.1:0" or a Unix socket. Serve takes ownership of ln
 // and closes it on return.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	if s.blockProfileRate > 0 {
+		runtime.SetBlockProfileRate(s.blockProfileRate)
+	}
+	if s.mutexProfileFraction > 0 {
+		runtime.SetMutexProfileFraction(s.mutexProfileFraction)
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.srv.Serve(ln) }()
 
@@ -113,7 +140,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		defer cancel()
 
 		shutdownErr := s.srv.Shutdown(shutdownCtx)
-		<-errCh // Serve r/home/user/workspace/go-pprofeturns ErrServerClosed as soon as Shutdown starts.
+		<-errCh // Serve returns ErrServerClosed as soon as Shutdown starts.
 		if shutdownErr != nil {
 			return fmt.Errorf("pprof: shutdown: %w", shutdownErr)
 		}

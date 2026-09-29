@@ -2,112 +2,134 @@ package pprof
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/pprof"
+	"strconv"
 	"time"
 )
 
+// Endpoint paths. Named profiles (heap, goroutine, allocs, block, mutex,
+// threadcreate) are served by the index handler under PathPrefix.
 const (
-	pprofURL        = "/debug/pprof/"
-	cmdlineURL      = "/debug/pprof/cmdline"
-	profileURL      = "/debug/pprof/profile"
-	symbolURL       = "/debug/pprof/symbol"
-	traceURL        = "/debug/pprof/trace"
-	goroutineURL    = "/debug/pprof/goroutine"
-	heapURL         = "/debug/pprof/heap"
-	allocsURL       = "/debug/pprof/allocs"
-	threadcreateURL = "/debug/pprof/threadcreate"
-	blockURL        = "/debug/pprof/block"
-	mutexURL        = "/debug/pprof/mutex"
+	PathPrefix  = "/debug/pprof/"
+	cmdlinePath = PathPrefix + "cmdline"
+	profilePath = PathPrefix + "profile"
+	symbolPath  = PathPrefix + "symbol"
+	tracePath   = PathPrefix + "trace"
 )
 
-// Register adds all standard pprof handlers to the given mux.
-// Use this when you want to mount pprof on your existing HTTP server.
-func Register(mux *http.ServeMux) {
-	mux.HandleFunc(pprofURL, pprof.Index)
-	mux.HandleFunc(cmdlineURL, pprof.Cmdline)
-	mux.HandleFunc(profileURL, pprof.Profile)
-	mux.HandleFunc(symbolURL, pprof.Symbol)
-	mux.HandleFunc(traceURL, pprof.Trace)
-	mux.Handle(goroutineURL, pprof.Handler("goroutine"))
-	mux.Handle(heapURL, pprof.Handler("heap"))
-	mux.Handle(allocsURL, pprof.Handler("allocs"))
-	mux.Handle(threadcreateURL, pprof.Handler("threadcreate"))
-	mux.Handle(blockURL, pprof.Handler("block"))
-	mux.Handle(mutexURL, pprof.Handler("mutex"))
+// Register mounts all standard pprof handlers on mux under /debug/pprof/.
+// Optional middlewares wrap every handler; the first one is the outermost.
+//
+// Note: this exposes pprof on whatever address mux is served on. Prefer a
+// separate [Server] on localhost, or protect the endpoints with
+// [BasicAuth] / [AllowNetworks].
+func Register(mux *http.ServeMux, mws ...Middleware) {
+	handle := func(path string, h http.HandlerFunc) {
+		mux.Handle(path, chain(h, mws))
+	}
+	// pprof.Index also serves every named profile: /heap, /goroutine, ...
+	handle(PathPrefix, pprof.Index)
+	handle(cmdlinePath, pprof.Cmdline)
+	handle(profilePath, pprof.Profile)
+	handle(symbolPath, pprof.Symbol)
+	handle(tracePath, pprof.Trace)
 }
 
-// Server is a standalone pprof HTTP server (recommended for security – run on a separate port).
+// Handler returns an http.Handler serving all pprof endpoints under
+// /debug/pprof/, wrapped in the given middlewares.
+func Handler(mws ...Middleware) http.Handler {
+	mux := http.NewServeMux()
+	Register(mux, mws...)
+	return mux
+}
+
+// Server is a standalone pprof HTTP server.
+// Running it on localhost on a separate port is the recommended setup.
+//
+// A Server is single-use: once it has been shut down it cannot be started
+// again. Its methods are safe for concurrent use.
 type Server struct {
-	address           string
-	readHeaderTimeout time.Duration
-	httpServer        *http.Server
+	addr            string
+	shutdownTimeout time.Duration
+	srv             *http.Server
 }
 
-// NewServer creates a new pprof server.
-// Defaults are applied: Host="", Port=0, ReadHeaderTimeout=0 → localhost:6060 with 10s timeout.
+// NewServer creates a new pprof server. Zero-valued fields of cfg are
+// replaced with defaults, so NewServer(Config{}) listens on 127.0.0.1:6060.
 func NewServer(cfg Config) *Server {
-	if cfg.Host == "" {
-		cfg.Host = "127.0.0.1" // security best practice – pprof leaks sensitive data
-	}
-	if cfg.Port == 0 {
-		cfg.Port = 6060 // conventional pprof port
-	}
-	if cfg.ReadHeaderTimeout == 0 {
-		cfg.ReadHeaderTimeout = 10 * time.Second
-	}
+	cfg = cfg.withDefaults()
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
 	return &Server{
-		address:           fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		readHeaderTimeout: cfg.ReadHeaderTimeout,
+		addr:            addr,
+		shutdownTimeout: cfg.ShutdownTimeout,
+		srv: &http.Server{
+			Addr:              addr,
+			Handler:           Handler(cfg.Middlewares...),
+			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		},
 	}
 }
 
-// Run starts the pprof server and blocks until the context is canceled or an error occurs.
-// It performs a graceful shutdown when the context is done.
+// Addr returns the configured listen address ("host:port").
+func (s *Server) Addr() string { return s.addr }
+
+// Run listens on the configured address and serves until ctx is canceled,
+// then shuts down gracefully (bounded by Config.ShutdownTimeout).
+//
+// The listening socket is opened synchronously, so an error such as
+// "address already in use" is returned immediately.
+// Run returns nil after a normal shutdown (ctx canceled, or [Server.Shutdown]
+// / [Server.Close] called).
 func (s *Server) Run(ctx context.Context) error {
-	mux := http.NewServeMux()
-	Register(mux)
-
-	s.httpServer = &http.Server{
-		Addr:              s.address,
-		Handler:           mux,
-		ReadHeaderTimeout: s.readHeaderTimeout,
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("pprof: listen on %s: %w", s.addr, err)
 	}
+	return s.Serve(ctx, ln)
+}
 
+// Serve is like [Server.Run] but uses the provided listener, for example
+// one bound to "127.0.0.1:0" or a Unix socket. Serve takes ownership of ln
+// and closes it on return.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	errCh := make(chan error, 1)
-	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
-		}
-	}()
+	go func() { errCh <- s.srv.Serve(ln) }()
 
 	select {
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("pprof server shutdown: %w", err)
-		}
-		return ctx.Err()
 	case err := <-errCh:
-		return err
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("pprof: serve: %w", err)
+
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+		defer cancel()
+
+		shutdownErr := s.srv.Shutdown(shutdownCtx)
+		<-errCh // Serve r/home/user/workspace/go-pprofeturns ErrServerClosed as soon as Shutdown starts.
+		if shutdownErr != nil {
+			return fmt.Errorf("pprof: shutdown: %w", shutdownErr)
+		}
+		return nil
 	}
 }
 
-// Shutdown gracefully shuts down the server (preferred over Close).
+// Shutdown gracefully shuts down the server, waiting for active requests
+// until ctx is done. Calling it before Run/Serve makes them return nil
+// immediately without serving.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.httpServer == nil {
-		return nil
-	}
-	return s.httpServer.Shutdown(ctx)
+	return s.srv.Shutdown(ctx)
 }
 
-// Close immediately closes all connections (use only as last resort).
+// Close immediately closes all listeners and connections.
+// Prefer [Server.Shutdown]; use Close only as a last resort.
 func (s *Server) Close() error {
-	if s.httpServer == nil {
-		return nil
-	}
-	return s.httpServer.Close()
+	return s.srv.Close()
 }

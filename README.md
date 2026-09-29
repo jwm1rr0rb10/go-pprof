@@ -1,61 +1,22 @@
-# pprof
+# go-pprof
 
-A simple, safe, and production-ready library for enabling **pprof** profiling in Go applications.
+[Русская версия](READMEru.md)
 
----
+A small wrapper around [`net/http/pprof`](https://pkg.go.dev/net/http/pprof) for Go applications: mount pprof on your own mux or run a separate pprof server on localhost with graceful shutdown, and optionally protect the endpoints with basic auth or an IP allowlist.
 
-## Possibilities
-
-- Full support for **all** standard pprof endpoints (`/debug/pprof/`)
-- Convenient handler registration into any existing `http.ServeMux`
-- Graceful shutdown with `context.Context` support
-- Secure default settings (`127.0.0.1:6060`)
-- Clean, well-tested, and well-documented code
-- Minimalist and user-friendly API
+No dependencies outside the standard library. Requires Go 1.21+.
 
 ## Installation
 
-Simply add the package to your project:
-
-```bash
-go get -u github.com/jwm1rr0rb10/go-pprof
 ```
-
----
+go get github.com/jwm1rr0rb10/go-pprof
+```
 
 ## Usage
-1. Registering with an existing HTTP server (recommended method)
 
+### Standalone server on localhost (recommended)
 
-```go
-package main
-
-import (
-	"net/http"
-
-	"github.com/jwm1rr0rb10/go-pprof"
-)
-
-func main() {
-	mux := http.NewServeMux()
-
-	// Add all pprof endpoints in a single line
-	pprof.Register(mux)
-
-	// Your standard handlers
-	mux.HandleFunc("/api/health", healthHandler)
-	mux.HandleFunc("/api/users", usersHandler)
-
-	http.ListenAndServe(":8080", mux)
-}
-```
-
-Profiling is now available at:
-`http://localhost:8080/debug/pprof/`
-
----
-
-## 2. Standalone pprof Server (Separate Port)
+Running pprof on a separate port bound to `127.0.0.1` keeps it away from your public API.
 
 ```go
 package main
@@ -63,85 +24,137 @@ package main
 import (
 	"context"
 	"log"
-	"time"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/jwm1rr0rb10/go-pprof"
 )
 
 func main() {
-	// You can use NewConfig("", 0, 0) — default values ​​will be applied.
-	cfg := pprof.NewConfig("127.0.0.1", 6060, 10*time.Second)
-	server := pprof.NewServer(cfg)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Config{} listens on 127.0.0.1:6060.
+	srv := pprof.NewServer(pprof.Config{})
 
-	// Start the pprof server in a separate goroutine.
 	go func() {
-		if err := server.Run(ctx); err != nil && err != context.Canceled {
-			log.Printf("pprof server error: %v", err)
+		if err := srv.Run(ctx); err != nil {
+			log.Printf("pprof: %v", err)
 		}
 	}()
 
-	// ... your application's main code ...
+	// ... your application ...
 
-	// Upon application termination, gracefully stop the pprof server.
-	<-someShutdownSignal
-	cancel()
+	<-ctx.Done()
 }
 ```
 
----
+`Run` opens the socket synchronously, so errors like "address already in use" are returned immediately. It returns `nil` after a normal shutdown, so there is no need to filter out `context.Canceled`.
+
+To listen on a random free port or a Unix socket, create the listener yourself and pass it to `Serve`:
+
+```go
+ln, err := net.Listen("tcp", "127.0.0.1:0")
+if err != nil {
+	log.Fatal(err)
+}
+log.Printf("pprof on http://%s/debug/pprof/", ln.Addr())
+go srv.Serve(ctx, ln)
+```
+
+### Mounting on an existing mux
+
+```go
+mux := http.NewServeMux()
+pprof.Register(mux)
+mux.HandleFunc("/api/health", healthHandler)
+
+// Only on a trusted network: pprof is now served wherever mux is.
+http.ListenAndServe("127.0.0.1:8080", mux)
+```
+
+If this mux is reachable from outside, protect the endpoints (see below). `pprof.Handler(...)` returns a ready `http.Handler` if you prefer to mount it yourself.
+
+### Protecting the endpoints
+
+Both `Register` and `Config.Middlewares` accept middleware. The first middleware in the list is the outermost.
+
+```go
+allow, err := pprof.AllowNetworks("10.0.0.0/8", "127.0.0.1")
+if err != nil {
+	log.Fatal(err)
+}
+
+pprof.Register(mux, allow, pprof.BasicAuth("admin", os.Getenv("PPROF_PASSWORD")))
+
+// or for the standalone server:
+srv := pprof.NewServer(pprof.Config{
+	Host:        "0.0.0.0",
+	Middlewares: []pprof.Middleware{allow},
+})
+```
+
+`BasicAuth` compares credentials in constant time and panics on an empty username or password. Basic auth sends credentials in clear text, so use it over TLS or on a private network.
+
+`AllowNetworks` accepts CIDR prefixes and single IPs, IPv4 and IPv6. It checks only `r.RemoteAddr` and ignores `X-Forwarded-For`, because clients can forge that header. Behind a reverse proxy it will see the proxy's address.
+
+Any `func(http.Handler) http.Handler` works as a middleware, so you can plug in your own auth.
 
 ## Configuration
 
 ```go
-cfg := pprof.NewConfig(host, port, readHeaderTimeout)
-
-
-// Default values ​​(if empty values ​​are passed):
-// Host:              "127.0.0.1"
-// Port:              6060
-// ReadHeaderTimeout: 10 * time.Second
+pprof.Config{
+	Host:              "127.0.0.1",      // default
+	Port:              6060,             // default
+	ReadHeaderTimeout: 10 * time.Second, // default, protects against slow clients
+	ShutdownTimeout:   15 * time.Second, // default, bounds graceful shutdown
+	Middlewares:       nil,
+}
 ```
 
----
+Zero values are replaced with defaults. `NewConfig(host, port, readHeaderTimeout)` is kept for backward compatibility. No `WriteTimeout` is set on purpose, because `/profile` and `/trace` stream data for as long as the client asks (30 seconds by default for `/profile`).
 
-## Лучшие практики
+A `Server` is single-use: after shutdown it cannot be started again. Its methods are safe to call from different goroutines.
 
-- Never expose pprof to the internet—it contains sensitive information about your application.
-- Run it only on localhost or within a private network/VPC.
-- It is recommended to use `pprof.Register(mux)` instead of a separate server.
-- The standard port for pprof is 6060.
+## Security notes
 
----
+Never expose pprof to the internet. Profiles reveal memory contents, command-line arguments, goroutine stacks and internal structure, and `/profile` and `/trace` can be used to load the CPU.
 
-## Доступные эндпоинты
+This package imports `net/http/pprof`, whose `init` function registers all handlers on `http.DefaultServeMux`. No wrapper can prevent that. If your application serves `http.DefaultServeMux` (for example `http.ListenAndServe(addr, nil)` or `http.Handle(...)`), pprof will be reachable there as well. Always use your own `http.ServeMux` for public servers.
 
-| Эндпоинт                  | Описание                            |
-|:--------------------------|:------------------------------------|
-| /debug/pprof/             | Home Page (Index)                   |
-| /debug/pprof/profile      | CPU Profile (30 seconds by default) |
-| /debug/pprof/heap         | Heap snapshot                       |
-| /debug/pprof/allocs       | Object Allocations                  |
-| /debug/pprof/goroutine    | Goroutine stack                     |
-| /debug/pprof/block        | Blocking Operations                 |
-| /debug/pprof/mutex        | Mutex Contention                    |
-| /debug/pprof/threadcreate | Created Streams                     |
-| /debug/pprof/trace        | Execution Tracex                    |
-| /debug/pprof/cmdline      | Command Line                   |
-| /debug/pprof/symbol       | Symbols (for Instruments)          |
+## Endpoints
 
----
+| Endpoint | Description |
+| --- | --- |
+| `/debug/pprof/` | Index page |
+| `/debug/pprof/profile` | CPU profile (`?seconds=N`, default 30) |
+| `/debug/pprof/heap` | Heap memory sampling |
+| `/debug/pprof/allocs` | Past memory allocations |
+| `/debug/pprof/goroutine` | Stacks of all goroutines |
+| `/debug/pprof/block` | Blocking on synchronization primitives* |
+| `/debug/pprof/mutex` | Mutex contention* |
+| `/debug/pprof/threadcreate` | Stacks that created OS threads |
+| `/debug/pprof/trace` | Execution trace (`?seconds=N`, default 1) |
+| `/debug/pprof/cmdline` | Program command line |
+| `/debug/pprof/symbol` | Symbol lookup for program counters |
 
-## Testing
+\* Block and mutex profiles are empty unless enabled with `runtime.SetBlockProfileRate` and `runtime.SetMutexProfileFraction`.
 
-```bash
-go test ./...
+Example:
+
+```
+go tool pprof -http=:8081 http://127.0.0.1:6060/debug/pprof/profile?seconds=10
 ```
 
----
+## Development
 
-## ## License
-[MIT License](https://github.com/jwm1rr0rb10/go-pprof/blob/main/LICENSE) – © Raman Zaitsau [@jwm1rrr0rb10](https://github.com/jwm1rr0rb10)
+```
+make race   # tests with the race detector
+make cover  # coverage report
+make lint   # staticcheck
+```
 
+## License
+
+[MIT](LICENSE) © Raman Zaitsau

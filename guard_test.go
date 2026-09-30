@@ -131,8 +131,8 @@ func TestGuardPostBodyCannotBypassClamp(t *testing.T) {
 }
 
 func TestGuardExpensiveParameters(t *testing.T) {
-	strict := Guard(Limits{})(okHandler)
-	relaxed := Guard(Limits{AllowForcedGC: true, AllowFullGoroutineDump: true})(okHandler)
+	strict := Guard(Limits{MinInterval: -1})(okHandler)
+	relaxed := Guard(Limits{MinInterval: -1, AllowForcedGC: true, AllowFullGoroutineDump: true})(okHandler)
 
 	tests := []struct {
 		target      string
@@ -195,7 +195,7 @@ func blockingHandler() (h http.Handler, entered <-chan struct{}, release func())
 func TestGuardMaxConcurrent(t *testing.T) {
 	inner, entered, release := blockingHandler()
 	defer release()
-	h := Guard(Limits{MaxConcurrent: 2})(inner)
+	h := Guard(Limits{MaxConcurrent: 2, MinInterval: -1})(inner)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
@@ -250,7 +250,7 @@ func TestGuardOneProfileAndOneTraceAtATime(t *testing.T) {
 func TestGuardUnlimitedConcurrency(t *testing.T) {
 	inner, entered, release := blockingHandler()
 	defer release()
-	h := Guard(Limits{MaxConcurrent: -1})(inner)
+	h := Guard(Limits{MaxConcurrent: -1, MinInterval: -1})(inner)
 
 	for i := 0; i < 20; i++ {
 		go serve(h, http.MethodGet, "/debug/pprof/heap")

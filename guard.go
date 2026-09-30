@@ -1,11 +1,18 @@
 package pprof
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
+	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,6 +23,9 @@ const (
 	DefaultMaxTraceDuration   = 10 * time.Second
 	DefaultMaxConcurrent      = 4
 	DefaultWriteTimeout       = 30 * time.Second
+	DefaultReadTimeout        = 10 * time.Second
+	DefaultMinInterval        = 1 * time.Second
+	DefaultMaxSymbolBodyBytes = 1 << 20
 )
 
 // Defaults of net/http/pprof when "seconds" is missing or invalid.
@@ -23,6 +33,10 @@ const (
 	stdProfileDuration = 30 * time.Second
 	stdTraceDuration   = 1 * time.Second
 )
+
+// busyRetryAfter is the Retry-After sent when MaxConcurrent is reached: the
+// guard cannot know when the running requests will finish.
+const busyRetryAfter = 5 * time.Second
 
 // Limits protect a production service from expensive or careless
 // requests to pprof endpoints. The zero value is a safe configuration:
@@ -47,12 +61,31 @@ type Limits struct {
 	// 0 means DefaultMaxConcurrent (4); negative means no limit.
 	MaxConcurrent int
 
+	// MinInterval is the minimum time between two requests to the same
+	// profile endpoint (/heap, /goroutine, /profile, ...). Each endpoint has
+	// its own clock, so /heap and /goroutine can be taken back to back, but
+	// a script polling /goroutine in a loop gets 429 with an exact
+	// Retry-After. The cheap endpoints (index, cmdline, symbol) are not
+	// limited. 0 means DefaultMinInterval (1s); negative means no limit.
+	MinInterval time.Duration
+
 	// WriteTimeout is how long the response may take to write after the
 	// profile has been collected. It frees slots held by slow or stuck
 	// clients. The write deadline of a request is its collection time
 	// (e.g. the clamped "seconds") plus WriteTimeout.
 	// 0 means DefaultWriteTimeout (30s); negative means no deadline.
 	WriteTimeout time.Duration
+
+	// ReadTimeout is how long a client may take to send the body of
+	// POST /symbol, the only endpoint that reads one. Slower clients get
+	// 408 and free their slot. 0 means DefaultReadTimeout (10s); negative
+	// means no deadline.
+	ReadTimeout time.Duration
+
+	// MaxSymbolBodyBytes caps the body of POST /symbol. Larger bodies get
+	// 413. 0 means DefaultMaxSymbolBodyBytes (1 MiB, tens of thousands of
+	// addresses); negative means no limit.
+	MaxSymbolBodyBytes int64
 
 	// AllowForcedGC allows /heap?gc=1, which runs a full garbage collection
 	// before taking the profile. Rejected with 403 by default, because a
@@ -96,6 +129,10 @@ const (
 	RejectedForcedGC      = "forced GC not allowed"
 	RejectedGoroutineDump = "full goroutine dump not allowed"
 	RejectedBusy          = "too many concurrent requests"
+	RejectedRateLimited   = "requested too often"
+	RejectedBodyTooLarge  = "request body too large"
+	RejectedReadTimeout   = "request body read timeout"
+	RejectedBadBody       = "cannot read request body"
 )
 
 func (l Limits) withDefaults() Limits {
@@ -108,8 +145,17 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxConcurrent == 0 {
 		l.MaxConcurrent = DefaultMaxConcurrent
 	}
+	if l.MinInterval == 0 {
+		l.MinInterval = DefaultMinInterval
+	}
 	if l.WriteTimeout == 0 {
 		l.WriteTimeout = DefaultWriteTimeout
+	}
+	if l.ReadTimeout == 0 {
+		l.ReadTimeout = DefaultReadTimeout
+	}
+	if l.MaxSymbolBodyBytes == 0 {
+		l.MaxSymbolBodyBytes = DefaultMaxSymbolBodyBytes
 	}
 	return l
 }
@@ -134,7 +180,8 @@ func Guard(l Limits) Middleware {
 	if l.MaxConcurrent > 0 {
 		all = make(semaphore, l.MaxConcurrent)
 	}
-	cpu, trace := make(semaphore, 1), make(semaphore, 1)
+	cpu, trace := newExclusive(), newExclusive()
+	rate := newRateLimiter(l.MinInterval)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -157,13 +204,14 @@ func Guard(l Limits) Middleware {
 
 			reject := func(status int, reason string) {
 				info.Rejected = reason
-				if status == http.StatusTooManyRequests {
-					w.Header().Set("Retry-After", "5")
-				}
 				if status == http.StatusMethodNotAllowed {
 					w.Header().Set("Allow", allowedMethods(name))
 				}
 				http.Error(rec, reason, status)
+			}
+			tooMany := func(reason string, retryAfter time.Duration) {
+				w.Header().Set("Retry-After", retryAfterSeconds(retryAfter))
+				reject(http.StatusTooManyRequests, reason)
 			}
 
 			if disabled[name] {
@@ -196,17 +244,33 @@ func Guard(l Limits) Middleware {
 			}
 
 			if !all.tryAcquire() {
-				reject(http.StatusTooManyRequests, RejectedBusy)
+				tooMany(RejectedBusy, busyRetryAfter)
 				return
 			}
 			defer all.release()
 
-			if exclusive := exclusiveSem(name, cpu, trace); exclusive != nil {
-				if !exclusive.tryAcquire() {
-					reject(http.StatusTooManyRequests, RejectedBusy)
+			if ex := exclusiveFor(name, cpu, trace); ex != nil {
+				if wait, ok := ex.tryAcquire(start.Add(collect)); !ok {
+					tooMany(RejectedBusy, wait)
 					return
 				}
-				defer exclusive.release()
+				defer ex.release()
+			}
+
+			// Checked after the semaphores so that a request rejected as busy
+			// does not use up the interval.
+			if wait, ok := rate.allow(name, start); !ok {
+				tooMany(RejectedRateLimited, wait)
+				return
+			}
+
+			if name == "symbol" && r.Method == http.MethodPost {
+				var status int
+				var reason string
+				if r, status, reason = bufferBody(w, r, start, l); status != 0 {
+					reject(status, reason)
+					return
+				}
 			}
 
 			if l.WriteTimeout > 0 {
@@ -252,7 +316,7 @@ func allowedMethods(name string) string {
 	return "GET, HEAD"
 }
 
-func exclusiveSem(name string, cpu, trace semaphore) semaphore {
+func exclusiveFor(name string, cpu, trace *exclusive) *exclusive {
 	switch name {
 	case "profile":
 		return cpu
@@ -328,6 +392,68 @@ func atoi(s string) int {
 	return n
 }
 
+// retryAfterSeconds formats d for the Retry-After header: whole seconds,
+// rounded up, at least 1.
+func retryAfterSeconds(d time.Duration) string {
+	sec := int64((d + time.Second - 1) / time.Second)
+	if sec < 1 {
+		sec = 1
+	}
+	return strconv.FormatInt(sec, 10)
+}
+
+// bufferBody reads the body of POST /symbol into memory, enforcing
+// l.MaxSymbolBodyBytes and l.ReadTimeout, and returns a request whose body
+// is the buffered copy. net/http/pprof would otherwise read the body for
+// as long as the client keeps sending it, holding a concurrency slot. A
+// non-zero status means the request must be rejected with reason.
+func bufferBody(w http.ResponseWriter, r *http.Request, start time.Time, l Limits) (_ *http.Request, status int, reason string) {
+	rc := http.NewResponseController(w)
+	fail := func(status int, reason string) (*http.Request, int, string) {
+		// The rest of the body is not read: close the connection, and make
+		// sure net/http does not wait for the body before replying.
+		// Errors are ignored for the same reason as SetWriteDeadline.
+		w.Header().Set("Connection", "close")
+		_ = rc.SetReadDeadline(time.Now())
+		return r, status, reason
+	}
+
+	if l.MaxSymbolBodyBytes > 0 && r.ContentLength > l.MaxSymbolBodyBytes {
+		return fail(http.StatusRequestEntityTooLarge, RejectedBodyTooLarge)
+	}
+	if l.ReadTimeout > 0 {
+		_ = rc.SetReadDeadline(start.Add(l.ReadTimeout))
+	}
+
+	body := r.Body
+	if l.MaxSymbolBodyBytes > 0 {
+		// w, not a wrapper: MaxBytesReader tells the server to close the
+		// connection through the original ResponseWriter.
+		body = http.MaxBytesReader(w, body, l.MaxSymbolBodyBytes)
+	}
+	b, err := io.ReadAll(body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		var netErr net.Error
+		switch {
+		case errors.As(err, &tooLarge):
+			return fail(http.StatusRequestEntityTooLarge, RejectedBodyTooLarge)
+		case errors.As(err, &netErr) && netErr.Timeout():
+			return fail(http.StatusRequestTimeout, RejectedReadTimeout)
+		default:
+			return fail(http.StatusBadRequest, RejectedBadBody)
+		}
+	}
+	if l.ReadTimeout > 0 {
+		_ = rc.SetReadDeadline(time.Time{})
+	}
+
+	r = r.Clone(r.Context())
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	r.ContentLength = int64(len(b))
+	return r, 0, ""
+}
+
 // semaphore is a non-blocking counting semaphore; a nil semaphore has no
 // limit.
 type semaphore chan struct{}
@@ -348,6 +474,64 @@ func (s semaphore) release() {
 	if s != nil {
 		<-s
 	}
+}
+
+// exclusive allows one request at a time and remembers when the running
+// one is expected to finish, for an accurate Retry-After.
+type exclusive struct {
+	sem   semaphore
+	until atomic.Int64 // UnixNano when the current holder finishes collecting
+}
+
+func newExclusive() *exclusive { return &exclusive{sem: make(semaphore, 1)} }
+
+// tryAcquire takes the slot until the given time. If the slot is busy it
+// returns how long the current holder still needs.
+func (e *exclusive) tryAcquire(until time.Time) (wait time.Duration, ok bool) {
+	if e.sem.tryAcquire() {
+		e.until.Store(until.UnixNano())
+		return 0, true
+	}
+	return time.Until(time.Unix(0, e.until.Load())), false
+}
+
+func (e *exclusive) release() { e.sem.release() }
+
+// cheapEndpoints are never rate limited.
+var cheapEndpoints = map[string]bool{"index": true, "cmdline": true, "symbol": true}
+
+// rateLimiter enforces a minimum interval between requests to the same
+// endpoint. A nil rateLimiter allows everything.
+type rateLimiter struct {
+	interval time.Duration
+	mu       sync.Mutex
+	next     map[string]time.Time // earliest time the endpoint may be requested again
+}
+
+func newRateLimiter(interval time.Duration) *rateLimiter {
+	if interval <= 0 {
+		return nil
+	}
+	return &rateLimiter{interval: interval, next: make(map[string]time.Time)}
+}
+
+func (rl *rateLimiter) allow(name string, now time.Time) (wait time.Duration, ok bool) {
+	if rl == nil || cheapEndpoints[name] {
+		return 0, true
+	}
+	// Only track endpoints that exist, so that requests to random paths
+	// cannot grow the map. Unknown names get 404 from net/http/pprof anyway.
+	if name != "profile" && name != "trace" && pprof.Lookup(name) == nil {
+		return 0, true
+	}
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if next := rl.next[name]; now.Before(next) {
+		return next.Sub(now), false
+	}
+	rl.next[name] = now.Add(rl.interval)
+	return 0, true
 }
 
 // statusRecorder captures the status code for RequestInfo.

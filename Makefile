@@ -1,4 +1,4 @@
-.PHONY: all fmt vet test race cover lint tags
+.PHONY: all fmt vet test race cover lint bench tags
 
 all: fmt vet race
 
@@ -17,6 +17,9 @@ race:
 cover:
 	go test -race -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out
+
+bench:
+	go test -run='^$$' -bench=. -benchmem ./...
 
 lint:
 	go run honnef.co/go/tools/cmd/staticcheck@latest ./...

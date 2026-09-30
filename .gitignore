@@ -1,0 +1,9 @@
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# go test -coverprofile / pprof output
+coverage.out
+*.pprof
+*.test

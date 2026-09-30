@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -207,5 +208,24 @@ func TestRunReturnsListenErrorImmediately(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run on a busy port did not fail immediately")
+	}
+}
+
+func TestServerResetProfileRates(t *testing.T) {
+	prev := runtime.SetMutexProfileFraction(7)
+	defer runtime.SetMutexProfileFraction(prev)
+	defer runtime.SetBlockProfileRate(0)
+
+	s := NewServer(Config{
+		BlockProfileRate:     RecommendedBlockProfileRate,
+		MutexProfileFraction: RecommendedMutexProfileFraction,
+		ResetProfileRates:    true,
+	})
+	_ = s.Shutdown(context.Background())
+	if err := s.Serve(context.Background(), localListener(t)); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.SetMutexProfileFraction(-1); got != 7 {
+		t.Errorf("mutex profile fraction = %d, want the previous value 7", got)
 	}
 }

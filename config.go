@@ -18,8 +18,11 @@ const (
 // contention, with low constant overhead. Rate 1 / fraction 1 record every
 // event and are too expensive for production.
 const (
-	RecommendedBlockProfileRate     = 10_000 // record blocking events of ~10µs and longer
-	RecommendedMutexProfileFraction = 100    // record 1 of 100 mutex contention events
+	// Blocking events of 10µs and longer are always recorded; shorter ones
+	// are sampled with probability duration/10µs.
+	RecommendedBlockProfileRate = 10_000
+	// On average 1 of 100 mutex contention events is recorded.
+	RecommendedMutexProfileFraction = 100
 )
 
 // Config holds the configuration for the standalone pprof [Server].
@@ -66,6 +69,13 @@ type Config struct {
 	// /debug/pprof/mutex. See RecommendedMutexProfileFraction.
 	// This is a process-wide setting.
 	MutexProfileFraction int
+
+	// ResetProfileRates, if true, undoes BlockProfileRate and
+	// MutexProfileFraction when [Server.Run] or [Server.Serve] returns: the
+	// block profile rate is set to 0 (the runtime cannot report the previous
+	// value) and the mutex profile fraction is restored to what it was.
+	// Use it when profiling is switched on only for a debugging session.
+	ResetProfileRates bool
 }
 
 // NewConfig creates a Config with the most common fields set.

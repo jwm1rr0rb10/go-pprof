@@ -12,12 +12,16 @@
 //
 // Some pprof requests are expensive on a busy service: a long CPU profile
 // or execution trace, a forced GC (/heap?gc=1), a full goroutine dump
-// (/goroutine?debug=2). [Guard] caps profile and trace durations, limits
-// concurrent requests (and allows only one CPU profile and one trace at a
-// time), rejects the expensive parameters unless allowed, sets a
-// per-request write deadline so slow clients cannot hold slots, and reports
-// every request to an optional hook for audit logs and metrics. The zero
-// [Limits] value is a safe production configuration.
+// (/goroutine?debug=2), a script polling /goroutine in a loop. [Guard] caps
+// profile and trace durations, limits concurrent requests (and allows only
+// one CPU profile and one trace at a time), enforces a minimum interval
+// between requests to the same profile, rejects the expensive parameters
+// unless allowed, bounds the size and read time of request bodies and sets
+// a per-request write deadline so slow clients cannot hold slots, and
+// reports every request to an optional hook for audit logs and metrics.
+// Rejected requests get 429 with a Retry-After header telling the client
+// when to come back. The zero [Limits] value is a safe production
+// configuration.
 //
 // # Access control
 //

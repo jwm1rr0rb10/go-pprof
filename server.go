@@ -63,6 +63,7 @@ type Server struct {
 	shutdownTimeout      time.Duration
 	blockProfileRate     int
 	mutexProfileFraction int
+	resetProfileRates    bool
 	srv                  *http.Server
 }
 
@@ -83,6 +84,7 @@ func NewServer(cfg Config) *Server {
 		shutdownTimeout:      cfg.ShutdownTimeout,
 		blockProfileRate:     cfg.BlockProfileRate,
 		mutexProfileFraction: cfg.MutexProfileFraction,
+		resetProfileRates:    cfg.ResetProfileRates,
 		srv: &http.Server{
 			Addr:              addr,
 			Handler:           Handler(mws...),
@@ -120,9 +122,15 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.blockProfileRate > 0 {
 		runtime.SetBlockProfileRate(s.blockProfileRate)
+		if s.resetProfileRates {
+			defer runtime.SetBlockProfileRate(0)
+		}
 	}
 	if s.mutexProfileFraction > 0 {
-		runtime.SetMutexProfileFraction(s.mutexProfileFraction)
+		prev := runtime.SetMutexProfileFraction(s.mutexProfileFraction)
+		if s.resetProfileRates {
+			defer runtime.SetMutexProfileFraction(prev)
+		}
 	}
 
 	errCh := make(chan error, 1)

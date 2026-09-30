@@ -17,7 +17,9 @@ The standard handlers do exactly what the client asks. On a loaded service some 
 | `/heap?seconds=3600` | Holds a connection for an hour (delta profile) |
 | `/heap?gc=1` in a loop | A full garbage collection on every call |
 | `/goroutine?debug=2` | Pauses the program to dump every goroutine; huge with 100k+ goroutines |
+| `/goroutine` or `/heap` polled in a loop | Constant profiling cost; with 500k goroutines every call walks all their stacks |
 | Slow or stuck client | Holds the connection forever (no write timeout is possible for streaming endpoints) |
+| `POST /symbol` with a slow or huge body | The standard handler reads the body until EOF, holding the connection |
 
 This package puts a guard in front of the handlers with safe defaults, so a careless script or a curious colleague cannot slow down production.
 
@@ -122,14 +124,17 @@ The zero value of `pprof.Limits` is a safe production configuration.
 | --- | --- | --- |
 | `MaxProfileDuration` | 60s | Caps `seconds` of `/profile` and of delta profiles (`/heap?seconds=N`, ...). Longer requests are clamped, not rejected. |
 | `MaxTraceDuration` | 10s | Caps `seconds` of `/trace`. |
-| `MaxConcurrent` | 4 | Pprof requests served at once; extra ones get `429` with `Retry-After`. Only one `/profile` and one `/trace` run at a time regardless. |
+| `MaxConcurrent` | 4 | Pprof requests served at once; extra ones get `429` with `Retry-After`. Only one `/profile` and one `/trace` run at a time regardless; a second one gets `429` with `Retry-After` set to the time the running one still needs. |
+| `MinInterval` | 1s | Minimum time between two requests to the same profile (`/heap`, `/goroutine`, `/profile`, ...). Each endpoint has its own clock; `/`, `/cmdline` and `/symbol` are not limited. Too frequent requests get `429` with the exact `Retry-After`. |
 | `WriteTimeout` | 30s | Time allowed to write the response after collection. The write deadline is collection time + `WriteTimeout`, so stuck clients free their slot. |
+| `ReadTimeout` | 10s | Time allowed to send the body of `POST /symbol`; slower clients get `408`. |
+| `MaxSymbolBodyBytes` | 1 MiB | Maximum body of `POST /symbol`; larger bodies get `413`. |
 | `AllowForcedGC` | false | `/heap?gc=1` is rejected with `403` unless true. |
 | `AllowFullGoroutineDump` | false | `/goroutine?debug=2` is rejected with `403` unless true. `/goroutine?debug=1` (aggregated stacks) always works. |
 | `DisabledEndpoints` | none | Endpoints that return `404`: `"index"`, `"cmdline"`, `"profile"`, `"symbol"`, `"trace"`, or a profile name such as `"heap"`. |
 | `OnRequest` | nil | Called after every pprof request, including rejected ones, with a `RequestInfo`. For audit logs and metrics; keep it fast. |
 
-A negative duration or `MaxConcurrent` means no limit. Only `/symbol` accepts `POST`; other endpoints answer `405`, because the standard handlers also read parameters from a form body, which could bypass the duration caps.
+A negative duration, `MaxConcurrent` or `MaxSymbolBodyBytes` means no limit. Only `/symbol` accepts `POST`; other endpoints answer `405`, because the standard handlers also read parameters from a form body, which could bypass the duration caps.
 
 ## Access control
 
@@ -159,10 +164,11 @@ pprof.Config{
 	Limits:               pprof.Limits{},   // safe defaults
 	BlockProfileRate:     0,                // 0 = leave runtime setting unchanged
 	MutexProfileFraction: 0,                // 0 = leave runtime setting unchanged
+	ResetProfileRates:    false,            // true = undo the two settings above on shutdown
 }
 ```
 
-Zero values are replaced with defaults. There is no server-wide `WriteTimeout`, because `/profile` and `/trace` stream for as long as requested; `Guard` sets a per-request write deadline instead. `BlockProfileRate` and `MutexProfileFraction` are process-wide runtime settings applied when the server starts. The recommended values (`10_000` ns and `100`) keep the overhead low; `1` records every event and is too expensive for production.
+Zero values are replaced with defaults. There is no server-wide `WriteTimeout`, because `/profile` and `/trace` stream for as long as requested; `Guard` sets a per-request write deadline instead. `BlockProfileRate` and `MutexProfileFraction` are process-wide runtime settings applied when the server starts; with `ResetProfileRates` they are undone when `Run`/`Serve` returns (the block rate is set to 0, the mutex fraction is restored). The recommended values (`10_000` ns and `100`) keep the overhead low; `1` records every event and is too expensive for production.
 
 A `Server` is single-use: after shutdown it cannot be started again. Its methods are safe to call from different goroutines.
 
@@ -200,36 +206,13 @@ Example:
 go tool pprof -http=:8081 http://127.0.0.1:6060/debug/pprof/profile?seconds=10
 ```
 
-## Changelog
-
-### v1.1.0
-
-Fixes:
-
-- Data race between `Run` and `Shutdown`/`Close`; `Shutdown` before `Run` no longer lets the server start afterwards.
-- `Run` now reports "address already in use" and other listen errors immediately.
-- `Run` returns `nil` after a normal shutdown instead of `context.Canceled`.
-- IPv6 hosts such as `::1` produce a valid address.
-- Tests no longer take 30 seconds or depend on port 6060.
-
-Added:
-
-- `Limits` and `Guard`: duration caps, concurrency limits, one CPU profile and one trace at a time, blocking of `gc=1` and `debug=2`, disabled endpoints, per-request write deadlines, `OnRequest` hook.
-- `BasicAuth`, `AllowNetworks`, `Middleware`, `Handler`, `Server.Serve`, `Server.Addr`.
-- `Config.IdleTimeout`, `Config.ShutdownTimeout`, `Config.BlockProfileRate`, `Config.MutexProfileFraction`.
-- CI with race tests on Go 1.21 and stable, and staticcheck.
-
-Behavior changes:
-
-- `Server` applies the default `Limits`: long profiles are clamped, `/heap?gc=1` and `/goroutine?debug=2` return `403`, and non-`GET` requests except to `/symbol` return `405`. Set the corresponding `Limits` fields to restore the old behavior. `Register` without `Guard` is unchanged.
-- Minimum Go version lowered from 1.25 to 1.21.
-
 ## Development
 
 ```
 make race   # tests with the race detector
 make cover  # coverage report
 make lint   # staticcheck
+make bench  # benchmarks
 ```
 
 ## License

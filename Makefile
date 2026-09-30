@@ -1,4 +1,4 @@
-.PHONY: all fmt vet test race cover lint bench tags
+.PHONY: all fmt vet test race cover lint bench api vuln tags
 
 all: fmt vet race
 
@@ -28,6 +28,16 @@ bench:
 lint:
 	go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 	cd pprofprom && go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+# Fails if the API changed incompatibly since the latest release tag.
+# gorelease needs a clean working tree: commit first.
+api:
+	go run golang.org/x/exp/cmd/gorelease@latest -base=$$(git describe --tags --abbrev=0 --match 'v*')
+
+# Known vulnerabilities in reachable code, including the Go standard library.
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+	cd pprofprom && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 tags:
 	@bash -c ' \

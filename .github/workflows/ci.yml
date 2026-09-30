@@ -37,3 +37,23 @@ jobs:
         if: matrix.go == 'stable'
         working-directory: pprofprom
         run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      # Only on stable: older Go releases have known standard library
+      # vulnerabilities that are not this module's to fix.
+      - name: govulncheck
+        if: matrix.go == 'stable'
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+          cd pprofprom && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # COMPATIBILITY.md: no incompatible API change within a major version.
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gorelease compares against the latest tag
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: gorelease
+        run: go run golang.org/x/exp/cmd/gorelease@latest -base=$(git describe --tags --abbrev=0 --match 'v*')

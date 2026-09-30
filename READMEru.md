@@ -272,6 +272,11 @@ limits := pprof.Limits{OnRequest: func(i pprof.RequestInfo) {
 go tool pprof -http=:8081 http://127.0.0.1:6060/debug/pprof/profile?seconds=10
 ```
 
+## Совместимость и безопасность
+
+- [COMPATIBILITY.md](COMPATIBILITY.md): что обещает v1. Внутри v1 нет несовместимых изменений API; новые безопасные значения по умолчанию появляются только в минорных релизах и всегда с возможностью отключения; используйте литералы структур с именами полей. CI проверяет каждое изменение через `gorelease`.
+- [SECURITY.md](SECURITY.md): как сообщить об уязвимости приватно, сроки ответа, поддерживаемые версии.
+
 ## Разработка
 
 ```
@@ -279,6 +284,8 @@ make race   # тесты с race-детектором
 make cover  # отчёт о покрытии
 make lint   # staticcheck
 make bench  # бенчмарки
+make api    # совместимость API с последним релизом
+make vuln   # govulncheck
 ```
 
 ## Лицензия

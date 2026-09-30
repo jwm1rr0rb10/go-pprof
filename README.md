@@ -272,6 +272,11 @@ Example:
 go tool pprof -http=:8081 http://127.0.0.1:6060/debug/pprof/profile?seconds=10
 ```
 
+## Compatibility and security
+
+- [COMPATIBILITY.md](COMPATIBILITY.md): what v1 promises. No breaking API changes within v1; new safe defaults only in minor releases and always with an opt-out; use keyed struct literals. CI checks every change with `gorelease`.
+- [SECURITY.md](SECURITY.md): how to report a vulnerability privately, response times, supported versions.
+
 ## Development
 
 ```
@@ -279,6 +284,8 @@ make race   # tests with the race detector
 make cover  # coverage report
 make lint   # staticcheck
 make bench  # benchmarks
+make api    # API compatibility with the latest release
+make vuln   # govulncheck
 ```
 
 ## License

@@ -23,7 +23,12 @@ func chain(h http.Handler, mws []Middleware) http.Handler {
 }
 
 // BasicAuth returns a Middleware that requires HTTP Basic authentication.
-// Credentials are compared in constant time.
+// Credentials are compared in constant time. The username becomes the
+// request's principal (see [RequestInfo.Principal]).
+//
+// A single shared password is fine for a small team; on a large
+// organization prefer [Authorize] with per-user or per-service identities,
+// e.g. mTLS with [ClientCertPrincipal].
 //
 // It panics if username or password is empty, because that would make the
 // check trivially bypassable. Basic auth sends credentials in clear text,
@@ -50,7 +55,7 @@ func BasicAuth(username, password string) Middleware {
 				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 				return
 			}
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), user)))
 		})
 	}
 }

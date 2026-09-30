@@ -64,6 +64,7 @@ type Server struct {
 	blockProfileRate     int
 	mutexProfileFraction int
 	resetProfileRates    bool
+	tls                  bool
 	srv                  *http.Server
 }
 
@@ -85,8 +86,10 @@ func NewServer(cfg Config) *Server {
 		blockProfileRate:     cfg.BlockProfileRate,
 		mutexProfileFraction: cfg.MutexProfileFraction,
 		resetProfileRates:    cfg.ResetProfileRates,
+		tls:                  cfg.TLSConfig != nil,
 		srv: &http.Server{
 			Addr:              addr,
+			TLSConfig:         cfg.TLSConfig,
 			Handler:           Handler(mws...),
 			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 			IdleTimeout:       cfg.IdleTimeout,
@@ -134,7 +137,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- s.srv.Serve(ln) }()
+	go func() {
+		if s.tls {
+			// Certificates come from TLSConfig, so no files are passed.
+			errCh <- s.srv.ServeTLS(ln, "", "")
+			return
+		}
+		errCh <- s.srv.Serve(ln)
+	}()
 
 	select {
 	case err := <-errCh:

@@ -27,3 +27,13 @@ jobs:
       - name: staticcheck
         if: matrix.go == 'stable'
         run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      # pprofprom is a separate module; the root ./... does not include it.
+      - name: pprofprom vet and test
+        working-directory: pprofprom
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+      - name: pprofprom staticcheck
+        if: matrix.go == 'stable'
+        working-directory: pprofprom
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...

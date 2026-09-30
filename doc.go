@@ -26,7 +26,15 @@
 // # Access control
 //
 // [BasicAuth] and [AllowNetworks] restrict who can reach the endpoints.
-// Any func(http.Handler) http.Handler can be used as a [Middleware].
+// [Authorize] identifies each caller with your own function (mTLS via
+// [ClientCertPrincipal] and [Config.TLSConfig], SSO tokens, ...); the
+// identity is reported in [RequestInfo.Principal] for audit logs. Any
+// func(http.Handler) http.Handler can be used as a [Middleware].
+//
+// # Metrics
+//
+// The separate module github.com/jwm1rr0rb10/go-pprof/pprofprom exports
+// Prometheus metrics from [Limits.OnRequest].
 //
 // # Important: side effect of net/http/pprof
 //

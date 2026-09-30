@@ -1,6 +1,9 @@
 package pprof
 
-import "time"
+import (
+	"crypto/tls"
+	"time"
+)
 
 // Default values applied by [NewServer] when the corresponding
 // [Config] field is left at its zero value.
@@ -50,6 +53,12 @@ type Config struct {
 	// ShutdownTimeout bounds the graceful shutdown performed when the
 	// context passed to [Server.Run] or [Server.Serve] is canceled.
 	ShutdownTimeout time.Duration
+
+	// TLSConfig, if set, makes the server speak HTTPS. It must provide a
+	// certificate (Certificates or GetCertificate). For mTLS set ClientAuth
+	// to tls.RequireAndVerifyClientCert and ClientCAs, and identify callers
+	// with [Authorize] and [ClientCertPrincipal].
+	TLSConfig *tls.Config
 
 	// Middlewares wrap every pprof handler. The first one is the outermost.
 	// They run before the Limits checks, so put authentication here.

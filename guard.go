@@ -116,6 +116,7 @@ type RequestInfo struct {
 	Endpoint   string        // "index", "profile", "heap", ...
 	Method     string        // HTTP method
 	RemoteAddr string        // r.RemoteAddr
+	Principal  string        // caller identity set by Authorize, BasicAuth or WithPrincipal; "" if none
 	Status     int           // HTTP status code sent to the client
 	Duration   time.Duration // time spent serving the request
 	Seconds    float64       // effective "seconds" after clamping, 0 if not applicable
@@ -193,7 +194,12 @@ func Guard(l Limits) Middleware {
 
 			start := time.Now()
 			rec := &statusRecorder{ResponseWriter: w}
-			info := RequestInfo{Endpoint: name, Method: r.Method, RemoteAddr: r.RemoteAddr}
+			info := RequestInfo{
+				Endpoint:   name,
+				Method:     r.Method,
+				RemoteAddr: r.RemoteAddr,
+				Principal:  PrincipalFromContext(r.Context()),
+			}
 			defer func() {
 				if l.OnRequest != nil {
 					info.Status = rec.statusOrOK()

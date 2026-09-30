@@ -92,7 +92,7 @@ srv := pprof.NewServer(pprof.Config{
 		OnRequest: func(i pprof.RequestInfo) {
 			slog.Info("pprof request",
 				"endpoint", i.Endpoint, "remote", i.RemoteAddr, "status", i.Status,
-				"seconds", i.Seconds, "duration", i.Duration, "rejected", i.Rejected)
+				"principal", i.Principal, "seconds", i.Seconds, "duration", i.Duration, "rejected", i.Rejected)
 		},
 	},
 	// Enable /block and /mutex with low overhead.
@@ -149,6 +149,39 @@ if err != nil {
 
 `BasicAuth` compares credentials in constant time and panics on an empty username or password. Basic auth sends credentials in clear text, so use it over TLS or on a private network.
 
+### Per-caller identity and mTLS
+
+A shared basic auth password does not say *who* took a profile. `Authorize` takes a function that identifies the caller; the returned principal is stored in the request context and reported in `RequestInfo.Principal` for audit logs.
+
+```go
+allowed := map[string]bool{"spiffe://corp.example/ns/sre/sa/profiler": true}
+
+srv := pprof.NewServer(pprof.Config{
+	Host: "0.0.0.0",
+	TLSConfig: &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    corpCAs,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	},
+	Middlewares: []pprof.Middleware{pprof.Authorize(func(r *http.Request) (string, error) {
+		id, err := pprof.ClientCertPrincipal(r) // SPIFFE ID or certificate CN
+		if err != nil {
+			return "", err // ErrUnauthenticated -> 401
+		}
+		if !allowed[id] {
+			return id, errors.New("not in the pprof allowlist") // -> 403
+		}
+		return id, nil
+	})},
+})
+```
+
+- The function returns `pprof.ErrUnauthenticated` (or an error wrapping it) for `401` and any other error for `403`. The error text is never sent to the client.
+- `ClientCertPrincipal` returns the SPIFFE ID (a `spiffe://` URI SAN) of the verified client certificate, or its Common Name.
+- Instead of mTLS the function can check an SSO token, a service mesh header set by a trusted sidecar, and so on.
+- `BasicAuth` also sets the principal, to the username. Custom middleware can call `pprof.WithPrincipal`.
+
 Any `func(http.Handler) http.Handler` works as a middleware.
 
 ## Server configuration
@@ -160,6 +193,7 @@ pprof.Config{
 	ReadHeaderTimeout:    10 * time.Second, // default
 	IdleTimeout:          60 * time.Second, // default
 	ShutdownTimeout:      15 * time.Second, // default
+	TLSConfig:            nil,              // set for HTTPS / mTLS
 	Middlewares:          nil,
 	Limits:               pprof.Limits{},   // safe defaults
 	BlockProfileRate:     0,                // 0 = leave runtime setting unchanged
@@ -171,6 +205,38 @@ pprof.Config{
 Zero values are replaced with defaults. There is no server-wide `WriteTimeout`, because `/profile` and `/trace` stream for as long as requested; `Guard` sets a per-request write deadline instead. `BlockProfileRate` and `MutexProfileFraction` are process-wide runtime settings applied when the server starts; with `ResetProfileRates` they are undone when `Run`/`Serve` returns (the block rate is set to 0, the mutex fraction is restored). The recommended values (`10_000` ns and `100`) keep the overhead low; `1` records every event and is too expensive for production.
 
 A `Server` is single-use: after shutdown it cannot be started again. Its methods are safe to call from different goroutines.
+
+## Metrics
+
+Prometheus metrics live in a separate module, so the core package keeps no dependencies:
+
+```
+go get github.com/jwm1rr0rb10/go-pprof/pprofprom
+```
+
+```go
+m := pprofprom.MustNew(prometheus.DefaultRegisterer)
+
+limits := pprof.Limits{OnRequest: func(i pprof.RequestInfo) {
+	m.Observe(i)
+	slog.Info("pprof request", "endpoint", i.Endpoint, "principal", i.Principal, "status", i.Status)
+}}
+```
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `pprof_requests_total` | counter | `endpoint`, `code`, `rejected` |
+| `pprof_request_duration_seconds` | histogram | `endpoint` |
+| `pprof_profiling_seconds_total` | counter | `endpoint` |
+
+- All labels are bounded: unknown endpoints become `other`, and `rejected` is a short code such as `busy`, `rate_limited` or `forced_gc`.
+- The principal is not a label: it would create a series per caller. Keep it in the audit log.
+- `pprof_profiling_seconds_total` shows how long the service has been profiled. An alert on its rate catches a forgotten profiling script.
+- To add a prefix or constant labels, wrap the registerer with `prometheus.WrapRegistererWithPrefix` / `WrapRegistererWith`.
+
+## Many instances
+
+All limits are per process. A script that loops over 500 pods can still take 500 CPU profiles at the same moment, one per pod. For fleet-wide limits, route pprof through a proxy or a profiling service that enforces its own concurrency, or use a continuous profiler (see below) instead of ad hoc requests.
 
 ## Security notes
 

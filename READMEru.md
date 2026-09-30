@@ -92,7 +92,7 @@ srv := pprof.NewServer(pprof.Config{
 		OnRequest: func(i pprof.RequestInfo) {
 			slog.Info("pprof request",
 				"endpoint", i.Endpoint, "remote", i.RemoteAddr, "status", i.Status,
-				"seconds", i.Seconds, "duration", i.Duration, "rejected", i.Rejected)
+				"principal", i.Principal, "seconds", i.Seconds, "duration", i.Duration, "rejected", i.Rejected)
 		},
 	},
 	// Включить /block и /mutex с низкими накладными расходами.
@@ -149,6 +149,39 @@ if err != nil {
 
 `BasicAuth` сравнивает логин и пароль за константное время и паникует при пустом логине или пароле. Basic auth передаёт данные открытым текстом, поэтому используйте его поверх TLS или в приватной сети.
 
+### Идентичность вызывающего и mTLS
+
+Общий пароль basic auth не говорит, *кто* снял профиль. `Authorize` принимает функцию, которая определяет вызывающего; возвращённый principal кладётся в контекст запроса и попадает в `RequestInfo.Principal` для аудита.
+
+```go
+allowed := map[string]bool{"spiffe://corp.example/ns/sre/sa/profiler": true}
+
+srv := pprof.NewServer(pprof.Config{
+	Host: "0.0.0.0",
+	TLSConfig: &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    corpCAs,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	},
+	Middlewares: []pprof.Middleware{pprof.Authorize(func(r *http.Request) (string, error) {
+		id, err := pprof.ClientCertPrincipal(r) // SPIFFE ID или CN сертификата
+		if err != nil {
+			return "", err // ErrUnauthenticated -> 401
+		}
+		if !allowed[id] {
+			return id, errors.New("not in the pprof allowlist") // -> 403
+		}
+		return id, nil
+	})},
+})
+```
+
+- Функция возвращает `pprof.ErrUnauthenticated` (или ошибку, которая его оборачивает), чтобы получить `401`, и любую другую ошибку для `403`. Текст ошибки клиенту не отправляется.
+- `ClientCertPrincipal` возвращает SPIFFE ID (URI SAN вида `spiffe://`) проверенного клиентского сертификата или его Common Name.
+- Вместо mTLS функция может проверять SSO-токен, заголовок от доверенного sidecar service mesh и так далее.
+- `BasicAuth` тоже выставляет principal — имя пользователя. Собственный middleware может вызвать `pprof.WithPrincipal`.
+
 Middleware может быть любая функция `func(http.Handler) http.Handler`.
 
 ## Настройки сервера
@@ -160,6 +193,7 @@ pprof.Config{
 	ReadHeaderTimeout:    10 * time.Second, // по умолчанию
 	IdleTimeout:          60 * time.Second, // по умолчанию
 	ShutdownTimeout:      15 * time.Second, // по умолчанию
+	TLSConfig:            nil,              // задайте для HTTPS / mTLS
 	Middlewares:          nil,
 	Limits:               pprof.Limits{},   // безопасные значения
 	BlockProfileRate:     0,                // 0 = не менять настройку рантайма
@@ -171,6 +205,38 @@ pprof.Config{
 Нулевые значения заменяются значениями по умолчанию. Общего `WriteTimeout` у сервера нет, потому что `/profile` и `/trace` отдают данные столько, сколько запрошено; вместо него `Guard` ставит дедлайн записи для каждого запроса. `BlockProfileRate` и `MutexProfileFraction` — глобальные настройки рантайма, они применяются при старте сервера; с `ResetProfileRates` они откатываются, когда `Run`/`Serve` возвращает управление (block rate ставится в 0, mutex fraction восстанавливается). Рекомендуемые значения (`10_000` нс и `100`) дают низкие накладные расходы; `1` записывает каждое событие и слишком дорого для продакшена.
 
 `Server` одноразовый: после остановки его нельзя запустить снова. Его методы можно вызывать из разных горутин.
+
+## Метрики
+
+Метрики Prometheus вынесены в отдельный модуль, чтобы у основного пакета не было зависимостей:
+
+```
+go get github.com/jwm1rr0rb10/go-pprof/pprofprom
+```
+
+```go
+m := pprofprom.MustNew(prometheus.DefaultRegisterer)
+
+limits := pprof.Limits{OnRequest: func(i pprof.RequestInfo) {
+	m.Observe(i)
+	slog.Info("pprof request", "endpoint", i.Endpoint, "principal", i.Principal, "status", i.Status)
+}}
+```
+
+| Метрика | Тип | Метки |
+| --- | --- | --- |
+| `pprof_requests_total` | counter | `endpoint`, `code`, `rejected` |
+| `pprof_request_duration_seconds` | histogram | `endpoint` |
+| `pprof_profiling_seconds_total` | counter | `endpoint` |
+
+- Значения всех меток ограничены: неизвестные эндпоинты становятся `other`, а `rejected` — короткий код вроде `busy`, `rate_limited` или `forced_gc`.
+- Principal не выносится в метку: это дало бы по серии на каждого вызывающего. Держите его в журнале аудита.
+- `pprof_profiling_seconds_total` показывает, сколько времени сервис профилировали. Алерт на его скорость роста ловит забытый скрипт профилирования.
+- Для префикса или постоянных меток оберните registerer в `prometheus.WrapRegistererWithPrefix` / `WrapRegistererWith`.
+
+## Много экземпляров
+
+Все лимиты действуют в пределах одного процесса. Скрипт, который обходит 500 подов, всё равно может снять 500 CPU-профилей одновременно, по одному на под. Для лимитов на весь парк пускайте pprof через прокси или сервис профилирования со своим ограничением параллельности, либо используйте непрерывное профилирование (см. ниже) вместо разовых запросов.
 
 ## Безопасность
 
